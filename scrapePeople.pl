@@ -1,7 +1,38 @@
 #!/usr/bin/env perl
 
 use strict;
+
 use JSON::PP;
+use Getopt::Long;
+use DBI;
+use utf8;
+
+my $connection;
+my $user;
+my $password;
+
+GetOptions(
+  'db=s' => \$connection,
+  'user=s' => \$user,
+  'password=s' => \$password
+  );
+
+my $db = DBI->connect($connection, $user, $password, { RaiseError => 1, PrintError => 0 });
+
+# Setup the database.
+setupdb();
+
+my $insertPerson = 
+  $db->prepare(
+    "INSERT INTO people(id, name, title, company, active) VALUES (?, ?, ?, ?, ?)");
+
+my $countPostUrls = $db->prepare("select count(*) from posts where url = ?");
+
+my $insertPost = 
+  $db->prepare(
+    "INSERT INTO posts(id, published, title, url, summary, html) VALUES (?, ?, ?, ?, ?, ?)");
+
+my $fixPublished = $db->prepare("UPDATE posts set published = ? where url = ?");
 
 # Build a starting URL.
 my $peopleURL =
@@ -18,10 +49,6 @@ local $/;
 
 my $nextURL = $peopleURL;
 
-print qq{<?xml-stylesheet href="people.xsl" type="text/xsl" ?>};
-
-print "<people>\n";
-
 while(!$done)
   {
   my $data = `curl -s "$nextURL"`;
@@ -36,8 +63,6 @@ while(!$done)
     if not $nextURL;
   }
   
-print "</people>\n";
-
 # Parse JSON input for Apple people.
 sub parsePeople
   {
@@ -50,8 +75,8 @@ sub parsePeople
   
   foreach my $person (@{$list})
     {
-    print "  <person>\n";
     my $id = $person->{id};
+
     my $displayName = $person->{displayName};
     
     my $enabled = $person->{jive}->{enabled};
@@ -71,21 +96,19 @@ sub parsePeople
         }
       }
       
-    print "    <name>$displayName</name>\n";
-    
-    print "    <title>$title</title>\n"
-      if $title;
-      
-    print "    <company>$company</company>\n"
-      if $company;
-    
-    printf("    <active>%s</active>\n", ($enabled ? 'true' : 'false'));
-    
-    getActivities($id);
+    eval
+      {
+      $insertPerson->execute(
+        $id,
+        $displayName, 
+        $title, 
+        $company, 
+        ($enabled ? 'true' : 'false'));
+      };
 
-    print "  </person>\n";
+    getActivities($id);
     }  
-    
+   
   return $data->{links}->{next};
   }
   
@@ -109,7 +132,7 @@ sub getActivities
     # Toss the "throw 'allowIllegalResourceCall is false.';" line.
     $data = substr($data, 44);
     
-    $nextURL = parseActivities($data);
+    $nextURL = parseActivities($id, $data);
 
     last
       if not $nextURL;
@@ -119,6 +142,7 @@ sub getActivities
 # Parse a person's activities.
 sub parseActivities
   {
+  my $personid = shift;
   my $json = shift;
   
   # Decode the JSON.
@@ -142,19 +166,32 @@ sub parseActivities
 
     # There might be more entities to worry about.
 
-    my $url = $item->{url};
-    my $title = $item->{title};
     my $author = $item->{actor}->{displayName};
     
-    my $UUID = getMessage($id, $url, $author, $title);
+    eval
+      {
+      $countPostUrls->execute();
+
+      if($countPostUrls->fetchrow > 0)
+        {
+        $fixPublished->execute($item->{published}, $item->{url});
+
+        next;
+        }
+
+      my $UUID = getMessage($id, $item->{url}, $author, $item->{title});
     
-    print "    <post>\n";
-    print "      <title>$title</title>\n";
-    print "      <url>$url</url>\n";
-    
-    print "      <summary>$summary</summary>\n";
-    print "      <html>html/$UUID.html</html>\n";
-    print "    </post>\n";
+      eval
+        {
+        $insertPost->execute(
+          $personid, 
+          $item->{published}, 
+          $item->{title}, 
+          $item->{url}, 
+          $summary,
+          "html/$UUID.html");
+        };
+      };
     }  
     
   return $data->{links}->{next};
@@ -183,6 +220,7 @@ sub getMessage
   
   mkdir "html";
   open(OUT, ">html/$UUID.html");
+  binmode(OUT, ":utf8");
 
   my $html =<<EOS;
 <!DOCTYPE html>
@@ -231,4 +269,65 @@ EOS
   close(OUT);
   
   return $UUID;
+  }
+
+# Setup the database.
+sub setupdb
+  {
+  my $createPeople = << 'EOS';
+create table if not exists people
+  (
+  id text,
+  name text,
+  title text,
+  company text,
+  active text
+  )
+EOS
+
+  $db->do($createPeople);
+
+  my $createPeopleIdIndex = << 'EOS';
+create unique index if not exists people_id_index on people (id);
+EOS
+
+  $db->do($createPeopleIdIndex);
+
+  my $createPeopleNameIndex = << 'EOS';
+create index if not exists people_name_index on people (name);
+EOS
+
+  $db->do($createPeopleNameIndex);
+
+  my $createPosts = << 'EOS';
+create table if not exists posts
+  (
+  id text,
+  name text,
+  published text,
+  title text,
+  url text,
+  summary text,
+  html text
+  )
+EOS
+
+  $db->do($createPosts);
+
+  my $createPostsIndex = << 'EOS';
+create unique index if not exists posts_index on posts (url);
+EOS
+
+  $db->do($createPostsIndex);
+  }
+
+sub usage
+  {
+  return << 'EOS';
+Usage: scrapePeople.pl [options...]
+  where [options...] are:
+    db = DBI database connection string
+    user = Database user 
+    password = Database password
+EOS
   }
