@@ -24,15 +24,17 @@ setupdb();
 
 my $insertPerson = 
   $db->prepare(
-    "INSERT INTO people(id, name, title, company, active) VALUES (?, ?, ?, ?, ?)");
+    'INSERT INTO people(id, name, title, company, active) VALUES (?, ?, ?, ?, ?)');
 
-my $countPostUrls = $db->prepare("select count(*) from posts where url = ?");
+my $rowidForUrl = $db->prepare('select rowid from posts where url = ?');
 
 my $insertPost = 
   $db->prepare(
-    "INSERT INTO posts(id, published, title, url, summary, html) VALUES (?, ?, ?, ?, ?, ?)");
+    'INSERT INTO posts(id, name, published, title, url, json, summary) VALUES (?, ?, ?, ?, ?, ?, ?)');
 
-my $fixPublished = $db->prepare("UPDATE posts set published = ? where url = ?");
+my $updatePost = $db->prepare('UPDATE posts set html = ? where url = ?');
+
+my $fixPublished = $db->prepare('UPDATE posts set published = ? where url = ?');
 
 # Build a starting URL.
 my $peopleURL =
@@ -106,7 +108,7 @@ sub parsePeople
         ($enabled ? 'true' : 'false'));
       };
 
-    getActivities($id);
+    getActivities($id, $displayName);
     }  
    
   return $data->{links}->{next};
@@ -116,6 +118,7 @@ sub parsePeople
 sub getActivities
   {
   my $id = shift;
+  my $displayName = shift;
   
   my $url =
     "https://forums.developer.apple.com"
@@ -132,7 +135,7 @@ sub getActivities
     # Toss the "throw 'allowIllegalResourceCall is false.';" line.
     $data = substr($data, 44);
     
-    $nextURL = parseActivities($id, $data);
+    $nextURL = parseActivities($id, $displayName, $data);
 
     last
       if not $nextURL;
@@ -143,6 +146,7 @@ sub getActivities
 sub parseActivities
   {
   my $personid = shift;
+  my $displayName = shift;
   my $json = shift;
   
   # Decode the JSON.
@@ -152,7 +156,16 @@ sub parseActivities
   
   foreach my $item (@{$list})
     {
-    my $id = $item->{object}->{id};
+    next
+      if not $item->{url};
+
+    my ($message) = $item->{url} =~ /#(\d+)$/;
+
+    $message = scrapeMessage($item->{url})
+      if not $message;
+
+    my $id = "https://forums.developer.apple.com/api/core/v3/messages/$message";
+
     my $summary = $item->{object}->{summary};
     
     # These entities aren't defined in XML.
@@ -170,26 +183,48 @@ sub parseActivities
     
     eval
       {
-      $countPostUrls->execute();
+      $rowidForUrl->execute($item->{url});
 
-      if($countPostUrls->fetchrow > 0)
+      my ($rowid) = $rowidForUrl->fetchrow;
+
+      if($rowid > 0)
         {
         $fixPublished->execute($item->{published}, $item->{url});
+        }
+      else
+        {
+        eval
+          {
+          $insertPost->execute(
+            $personid, 
+            $displayName,
+            $item->{published}, 
+            $item->{title}, 
+            $item->{url}, 
+            "json/$message.json",
+            $summary);
 
-        next;
+          $rowid = $db->sqlite_last_insert_rowid();
+          my $htmlid = "html/$rowid.html";
+
+          $updatePost->execute($htmlid, $item->{url});
+          };
         }
 
-      my $UUID = getMessage($id, $item->{url}, $author, $item->{title});
-    
-      eval
+      my $htmlid = "html/$rowid.html";
+        
+      if(!-e $htmlid)
         {
-        $insertPost->execute(
-          $personid, 
-          $item->{published}, 
-          $item->{title}, 
+        print "Saving $id\n";
+
+        getMessage(
+          $htmlid, 
+          $id, 
+          $message,
           $item->{url}, 
-          $summary,
-          "html/$UUID.html");
+          $item->{published}, 
+          $displayName, 
+          $item->{title});
         };
       };
     }  
@@ -197,11 +232,28 @@ sub parseActivities
   return $data->{links}->{next};
   }
   
+# Get the message id from a thread.
+sub scrapeMessage
+  {
+  my $url = shift;
+
+  my ($thread) = $url =~ m|/thread/(\d+)$|;
+
+  my $html = `curl -s "$url"`;
+
+  my ($message) = $html =~ m|action="/post.jspa\?container=\d+\&containerType=14\&thread=$thread\&message=(\d+)\&reply=true"|gsm;
+  
+  return $message;
+  }
+
 # Get the HTML content for a post.
 sub getMessage
   {
+  my $htmlid = shift;
   my $id = shift;
+  my $message = shift;
   my $url = shift;
+  my $date = shift;
   my $author = shift;
   my $title = shift;
   
@@ -214,12 +266,10 @@ sub getMessage
   
   my $content = $data->{content}->{text};
 
-  my ($UUID) = $content =~ /\[DocumentBodyStart:(\S+)\]/;
-  
   $content =~ s/<body>(.*)<\/body>/$1/;
   
   mkdir "html";
-  open(OUT, ">html/$UUID.html");
+  open(OUT, ">$htmlid");
   binmode(OUT, ":utf8");
 
   my $html =<<EOS;
@@ -228,6 +278,7 @@ sub getMessage
   <head>
     <title>$title</title>
     <style>
+      .date,
       .author,
       .subject,
       .url
@@ -243,6 +294,10 @@ sub getMessage
   </head>
   <body>
     <table>
+      <tr>
+        <td class="date">Date:</td>
+        <td>$date</td>
+      </tr>
       <tr>
         <td class="author">Author:</td>
         <td>$author</td>
@@ -267,8 +322,14 @@ EOS
   print OUT $html;
   
   close(OUT);
+
+  mkdir "json";
+  open(JSON, ">json/$message.json");
+  binmode(JSON, ":utf8");
+
+  print JSON $json;
   
-  return $UUID;
+  close(JSON);
   }
 
 # Setup the database.
@@ -307,6 +368,7 @@ create table if not exists posts
   published text,
   title text,
   url text,
+  json text,
   summary text,
   html text
   )
